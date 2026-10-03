@@ -86,6 +86,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     departure = platform.depart(args.train, args.station)
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     final_sweep = platform.sweep(args.station)
+    merged = platform.merge_partitions(args.station)
+    partitions = platform.partition_view(args.station)
+    split = platform.split_merge(args.station)
 
     # 演示自检用临时端口，避免和本机常驻服务抢 8080。
     server = ConsoleServer(platform, port=0)
@@ -113,6 +116,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "final_sweep": {key: final_sweep[key] for key in ("closed", "scanned")},
+        "merged": merged,
+        "partitions": partitions,
+        "split": split,
         "probe": probe,
         "status": platform.status(),
     }
@@ -126,6 +132,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         ("cleared", cleared),
         ("sequence", sequence),
         ("departure", departure),
+        ("merged", merged),
+        ("split", split),
     ):
         if not operation.get("ok"):
             failures.extend(f"{name}:{item}" for item in operation.get("violations", []))

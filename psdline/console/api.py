@@ -73,6 +73,8 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/mapping/{stationID}", self._mapping)
         add("GET", "/api/resolve", self._resolve)
+        add("GET", "/api/partitions", lambda params, body: self._platform.partition_view())
+        add("GET", "/api/partitions/{stationID}", self._partitions)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/arrive", self._arrive)
         add("POST", "/api/depart", self._depart)
@@ -88,6 +90,10 @@ class Api:
         add("POST", "/api/sequence", self._sequence)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/sweep", self._sweep)
+        add("POST", "/api/partition/isolate", self._partition_isolate)
+        add("POST", "/api/partition/recover", self._partition_recover)
+        add("POST", "/api/partition/merge", self._partition_merge)
+        add("POST", "/api/partition/split", self._partition_split)
         add("POST", "/api/dwell", self._dwell)
         add("POST", "/api/route", self._route)
         add("POST", "/api/reset-state", self._reset_state)
@@ -174,6 +180,23 @@ class Api:
         return self._platform.resolve_group(
             str(params.get("station_id", "")), str(params.get("group_key", ""))
         )
+
+    def _partitions(self, params: dict, body: dict) -> dict:
+        return self._platform.partition_view(str(params.get("stationID", "")))
+
+    def _partition_isolate(self, params: dict, body: dict) -> dict:
+        return self._platform.isolate_partition(
+            _require(body, "partition_id"), str(body.get("reason", "manual"))
+        )
+
+    def _partition_recover(self, params: dict, body: dict) -> dict:
+        return self._platform.recover_partition(_require(body, "partition_id"))
+
+    def _partition_merge(self, params: dict, body: dict) -> dict:
+        return self._platform.merge_partitions(_require(body, "station_id"))
+
+    def _partition_split(self, params: dict, body: dict) -> dict:
+        return self._platform.split_merge(_require(body, "station_id"))
 
     def _readiness(self, params: dict, body: dict) -> dict:
         checks = {

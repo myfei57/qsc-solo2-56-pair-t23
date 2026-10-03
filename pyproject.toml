@@ -20,6 +20,7 @@ packages = [
     "psdline.psd",
     "psdline.sig",
     "psdline.interlock",
+    "psdline.partition",
     "psdline.door",
     "psdline.platform",
     "psdline.gap",

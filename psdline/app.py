@@ -1,11 +1,13 @@
 """平台装配与控制循环。
 
 ``Platform`` 把命名空间、站台、列车、站台门、信号、联锁、门控、门区映射、间隙
-探测、配额与审计按真实调用链装到一起，并暴露四件事：到发编排（到站、发车、
-门区联动、批量开门、清扫）、控制循环、状态快照与手动检修动作。
+探测、配额、控制分区与审计按真实调用链装到一起，并暴露四件事：到发编排（到站、
+发车、门区联动、批量开门、清扫）、控制循环、状态快照与手动检修动作。
 
 控制链固定为「信号 → 停稳对位 → 开门 → 间隙探测 → 关门 → 发车 → 审计」，
-任何一步错位都会被对应组件拒绝，并把拒绝原因落进审计。
+任何一步错位都会被对应组件拒绝，并把拒绝原因落进审计。门控按控制分区隔离：
+每个分区有自己的开门顺序与限流，一个分区故障退出不影响其他分区按原语义运行，
+恢复并回后重新参与整站调度；分区状态、联锁判定与审计流水共用同一份分区事实。
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from .door import (
     process_queue,
     queued_total,
 )
-from .errors import RailError
+from .errors import InterlockError, RailError
 from .eventbus import Event, EventBus
 from .gap import GapRegistry, gap_summary
 from .ids import IdFactory
@@ -43,6 +45,9 @@ from .interlock import (
     verdict_of,
 )
 from .ns import Namespace, NamespaceRegistry
+from .partition import ACTIVE as PARTITION_ACTIVE
+from .partition import ISOLATED as PARTITION_ISOLATED
+from .partition import Partition, PartitionRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
 from .quota import QuotaRegistry
@@ -122,6 +127,7 @@ class Platform:
 
         self.gates = PSDRegistry(store)
         self.lockouts = LockoutRegistry(self.gates)
+        self.partitions = PartitionRegistry(store)
         self.signals = SignalController(store)
         self.faults = FaultRegistry(store)
         self.armers = InterlockArmer(store)
@@ -202,6 +208,9 @@ class Platform:
                             group=group,
                         )
                     )
+            self.partitions.ensure(
+                station_id, list(groups), self.config.partition.groups_per_partition
+            )
         for name, limit in (
             (ARRIVAL, self.config.quota.arrival_limit),
             (DEPART, self.config.quota.depart_limit),
@@ -213,13 +222,42 @@ class Platform:
         )
 
     def _restore(self) -> None:
-        """从落盘状态恢复操作计数与锁定状态。"""
+        """从落盘状态恢复操作计数、锁定状态与分区状态。
+
+        分区状态以故障登记表为准对账：仍有置位故障的分区必须处于隔离态，启动
+        时发现不一致就补隔离并补审计（可能上次崩溃在故障落盘与分区隔离之间）。
+        没有故障的隔离分区保持隔离，并回必须走带条件检查的恢复路径。
+        """
 
         state = self.store.read("platform/state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        for station in self.stations.list():
+            self.partitions.ensure(
+                station.id,
+                list(station.door_groups),
+                self.config.partition.groups_per_partition,
+            )
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        for action in self.partitions.reconcile(self.faults, self.gates, self.clock.now()):
+            if action["action"] == "isolated":
+                self.audit.record(
+                    "partition_isolated",
+                    "",
+                    action["station_id"],
+                    partition=action["partition"],
+                    faults=action["faults"],
+                    reason="restore_reconcile",
+                )
+            elif action["action"] == "split":
+                self.audit.record(
+                    "partition_split",
+                    "",
+                    action["station_id"],
+                    members=action["members"],
+                    reason=action["reason"],
+                )
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -423,12 +461,47 @@ class Platform:
         return {**report, **summary, "arrival_audit": entry.id}
 
     def doors_open(self, train_id: str, station_id: str) -> dict:
-        """开门并确认车门：对位必须先落盘。"""
+        """开门并确认车门：对位必须先落盘。
+
+        按放行域逐域开门：每个健康分区打开自己里程最近的门区，隔离分区整域
+        跳过并记进 ``skipped``，其余分区照常。全部分区都无法开门时整链拒绝
+        （没有任何门能开就是整体故障，不能放行）；站台还没有分区指派时退回
+        旧的整站主门区行为。
+        """
 
         report = open_doors(self.doors, train_id, self.clock.now())
-        group = self._primary_group(station_id)
-        if group:
-            open_group(self.doors, self.mappings, station_id, group)
+        domains = [
+            domain
+            for domain in self.partitions.domains(station_id, self.doors.batch_limit())
+            if domain.state == PARTITION_ACTIVE
+        ]
+        opened_groups: list[str] = []
+        skipped: dict[str, str] = {}
+        if domains:
+            mapping = self.mappings.current(station_id)
+            for domain in domains:
+                key = self._domain_primary_key(station_id, domain.groups, mapping)
+                if key is None:
+                    skipped[domain.key] = "unmapped"
+                    continue
+                resolved = mapping.groups.get(key, key) if mapping else key
+                gate_ids = [
+                    gate.id for gate in self.gates.by_station(station_id) if gate.group == resolved
+                ]
+                if any(self.lockouts.is_locked(gate_id) for gate_id in gate_ids):
+                    skipped[domain.key] = "locked"
+                    continue
+                open_group(self.doors, self.mappings, station_id, key, self.partitions)
+                opened_groups.append(resolved)
+            if not opened_groups:
+                raise InterlockError(
+                    f"站台 {station_id} 所有控制分区都无法开门", component="door"
+                )
+        else:
+            group = self._primary_group(station_id)
+            if group:
+                open_group(self.doors, self.mappings, station_id, group)
+                opened_groups.append(group)
         self.train_doors.confirm_open(train_id, self.clock.now())
         self.bus.publish(
             Event.of(
@@ -438,10 +511,33 @@ class Platform:
                 train_id=train_id,
                 station_id=station_id,
                 severity="notice",
-                group=group,
+                group=opened_groups[0] if opened_groups else "",
+                groups=opened_groups,
             )
         )
-        return {**report, "group": group}
+        return {
+            **report,
+            "group": opened_groups[0] if opened_groups else "",
+            "groups": opened_groups,
+            "skipped": skipped,
+        }
+
+    def _domain_primary_key(self, station_id: str, groups: tuple[str, ...], mapping) -> str | None:
+        """返回放行域内里程最近门区对应的逻辑键；映射没覆盖时返回 ``None``。"""
+
+        if mapping is None:
+            return None
+        layout = self.layouts.get(station_id)
+        distances = {zone.id: zone.distance_m for zone in layout.zones} if layout else {}
+        candidates = [
+            (key, physical)
+            for key, physical in mapping.groups.items()
+            if physical in groups
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (distances.get(item[1], 0), item[0]))
+        return candidates[0][0]
 
     def depart(self, train_id: str, station_id: str) -> dict:
         """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
@@ -460,11 +556,26 @@ class Platform:
             return {**report, **summary}
 
         gate = self._primary_gate(station_id)
+        locked_by_depart = False
         if gate is not None and not self.lockouts.is_locked(gate.id):
             self.lockouts.set(gate.id, True)
+            locked_by_depart = True
             steps.append(
                 {"component": "interlock", "action": "lock", "detail": {"psd_id": gate.id}}
             )
+        try:
+            return self._depart_locked(train_id, station_id, op_id, steps)
+        finally:
+            # 只解自己上的锁：故障锁由联锁清除路径负责，发车不能顺手放掉；
+            # 失败路径同样解锁，不能把瞬时锁留在现场。
+            if locked_by_depart and gate is not None:
+                self.lockouts.clear(gate.id)
+
+    def _depart_locked(
+        self, train_id: str, station_id: str, op_id: str, steps: list[dict]
+    ) -> dict:
+        """发车主体：瞬时锁已就位，返回前由调用方解锁。"""
+
         try:
             closed = close_and_audit(
                 self.doors, self.audit, train_id, station_id, DEPART, self.clock.now()
@@ -505,8 +616,6 @@ class Platform:
             {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
         )
         departure = depart(self.doors, train_id, self.clock.now())
-        if gate is not None:
-            self.lockouts.clear(gate.id)
         report = {
             "ok": True,
             "train_id": train_id,
@@ -533,11 +642,15 @@ class Platform:
         return {"ok": True, "train_id": train_id, "clear": result.clear, "violations": []}
 
     def renumber(self, station_id: str, groups: dict[str, str]) -> dict:
-        """按最新布局重排门区映射，并按新映射联动一次。"""
+        """按最新布局重排门区映射，并按新映射联动一次。
+
+        联动同样受分区隔离约束：目标门区所属分区已隔离时拒绝联动，避免在
+        故障分区上验证新映射。
+        """
 
         mapping = self.mappings.renumber(station_id, groups)
         first_key = sorted(groups)[0]
-        linked = open_group(self.doors, self.mappings, station_id, first_key)
+        linked = open_group(self.doors, self.mappings, station_id, first_key, self.partitions)
         self.audit.record("mapping_renumber", "", station_id, revision=mapping.revision)
         return {
             "ok": True,
@@ -572,7 +685,7 @@ class Platform:
         }
 
     def clear_fault(self, psd_id: str) -> dict:
-        """清除门区故障并按条件解锁。"""
+        """清除门区故障并按条件解锁；所属分区满足并回条件时自动并回。"""
 
         gate = self.gates.require(psd_id)
         allowed, reason = releasable(self.gates, psd_id, True)
@@ -580,15 +693,225 @@ class Platform:
             return {"ok": False, "psd_id": psd_id, "locked": True, "violations": [reason]}
         self.faults.clear_fault(self.lockouts, psd_id, self.clock.now())
         self.audit.record("interlock_clear", "", gate.station, psd_id=psd_id)
-        return {"ok": True, "psd_id": psd_id, "locked": False, "violations": []}
+        recovery = self._maybe_recover(gate)
+        return {
+            "ok": True,
+            "psd_id": psd_id,
+            "locked": False,
+            "recovery": recovery,
+            "violations": [],
+        }
 
     def set_fault(self, psd_id: str) -> dict:
-        """置位门区故障并锁定。"""
+        """置位门区故障并锁定；``isolate`` 模式下所属分区随即退出放行。"""
 
         gate = self.gates.require(psd_id)
-        self.faults.set_fault(self.lockouts, psd_id, self.clock.now())
+        now = self.clock.now()
+        self.faults.set_fault(self.lockouts, psd_id, now)
         self.audit.record("interlock_fault", "", gate.station, psd_id=psd_id)
-        return {"ok": True, "psd_id": psd_id, "locked": True, "violations": []}
+        partition_report: dict = {"mode": self.config.partition.failure_mode}
+        if self.config.partition.failure_mode == "isolate":
+            partition_report = {**partition_report, **self._isolate_for_fault(gate, now)}
+        return {
+            "ok": True,
+            "psd_id": psd_id,
+            "locked": True,
+            "partition": partition_report,
+            "violations": [],
+        }
+
+    # ---- 控制分区 -----------------------------------------------------
+
+    def _isolate_for_fault(self, gate: PSD, at: float) -> dict:
+        """把故障门所属分区退出放行；它在合并里时先拆合并。"""
+
+        partition = self.partitions.of_gate(gate)
+        if partition is None:
+            return {"isolated": ""}
+        merge = self.partitions.active_merge(partition.station_id)
+        split = False
+        if merge is not None and partition.id in merge.members:
+            record = self.partitions.split_merge(partition.station_id)
+            if record is not None:
+                self.audit.record(
+                    "partition_split",
+                    "",
+                    partition.station_id,
+                    partition=partition.id,
+                    members=list(record.members),
+                    reason="member_fault",
+                )
+                split = True
+        _updated, changed = self.partitions.isolate(partition.id, "fault", at)
+        if changed:
+            self.audit.record(
+                "partition_isolated",
+                "",
+                partition.station_id,
+                partition=partition.id,
+                groups=list(partition.groups),
+                reason="fault",
+            )
+        return {"isolated": partition.id, "changed": changed, "split": split}
+
+    def _partition_gates(self, partition: Partition) -> list[PSD]:
+        """列出分区成员门区的全部站台门。"""
+
+        return [
+            gate
+            for gate in self.gates.by_station(partition.station_id)
+            if gate.group in partition.groups
+        ]
+
+    def _recovery_blockers(self, partition: Partition) -> dict[str, str]:
+        """列出分区并回的阻碍：故障未清、门未关、锁未解或间隙异常。"""
+
+        blockers: dict[str, str] = {}
+        for gate in self._partition_gates(partition):
+            if self.faults.is_active(gate.id):
+                blockers[gate.id] = "fault_active"
+            elif gate.open:
+                blockers[gate.id] = "gate_open"
+            elif gate.locked:
+                blockers[gate.id] = "locked"
+        if self.gaps.blocked_ids():
+            blockers["gap"] = "gap_blocked"
+        return blockers
+
+    def _maybe_recover(self, gate: PSD) -> dict:
+        """故障清除后尝试把所属分区并回；条件不满足时报出阻碍。"""
+
+        partition = self.partitions.of_gate(gate)
+        if partition is None or partition.state != PARTITION_ISOLATED:
+            return {"recovered": ""}
+        blockers = self._recovery_blockers(partition)
+        if blockers:
+            return {"recovered": False, "partition": partition.id, "blockers": blockers}
+        _updated, changed = self.partitions.recover(partition.id, self.clock.now())
+        if changed:
+            self.audit.record(
+                "partition_recovered",
+                "",
+                partition.station_id,
+                partition=partition.id,
+                groups=list(partition.groups),
+                trigger="fault_clear",
+            )
+        return {"recovered": changed, "partition": partition.id}
+
+    def isolate_partition(self, partition_id: str, reason: str = "manual") -> dict:
+        """手动把一个分区退出放行（检修用）；它在合并里时先拆合并。"""
+
+        partition = self.partitions.require(partition_id)
+        now = self.clock.now()
+        merge = self.partitions.active_merge(partition.station_id)
+        split = False
+        if merge is not None and partition_id in merge.members:
+            record = self.partitions.split_merge(partition.station_id)
+            if record is not None:
+                self.audit.record(
+                    "partition_split",
+                    "",
+                    partition.station_id,
+                    partition=partition_id,
+                    members=list(record.members),
+                    reason="member_isolated",
+                )
+                split = True
+        _updated, changed = self.partitions.isolate(partition_id, reason, now)
+        if changed:
+            self.audit.record(
+                "partition_isolated",
+                "",
+                partition.station_id,
+                partition=partition_id,
+                groups=list(partition.groups),
+                reason=reason,
+            )
+        return {
+            "ok": True,
+            "partition": partition_id,
+            "state": PARTITION_ISOLATED,
+            "changed": changed,
+            "split": split,
+            "violations": [],
+        }
+
+    def recover_partition(self, partition_id: str) -> dict:
+        """把隔离分区并回放行；并回条件不满足时报出全部阻碍。"""
+
+        partition = self.partitions.require(partition_id)
+        if partition.state == PARTITION_ACTIVE:
+            return {
+                "ok": True,
+                "partition": partition_id,
+                "state": PARTITION_ACTIVE,
+                "changed": False,
+                "violations": [],
+            }
+        blockers = self._recovery_blockers(partition)
+        if blockers:
+            return {
+                "ok": False,
+                "partition": partition_id,
+                "state": partition.state,
+                "blockers": blockers,
+                "violations": [f"分区不满足并回条件: {','.join(sorted(blockers))}"],
+            }
+        self.partitions.recover(partition_id, self.clock.now())
+        self.audit.record(
+            "partition_recovered",
+            "",
+            partition.station_id,
+            partition=partition_id,
+            groups=list(partition.groups),
+            trigger="manual",
+        )
+        return {
+            "ok": True,
+            "partition": partition_id,
+            "state": PARTITION_ACTIVE,
+            "changed": True,
+            "violations": [],
+        }
+    def merge_partitions(self, station_id: str) -> dict:
+        """把站台全部健康分区临时并成一个放行域（限流叠加、顺序统一）。"""
+
+        if not self.config.partition.allow_merge:
+            return {"ok": False, "station_id": station_id, "violations": ["配置禁止临时合并"]}
+        try:
+            record = self.partitions.merge(station_id, self.clock.now())
+        except RailError as error:
+            return {"ok": False, "station_id": station_id, "violations": [error.message]}
+        self.audit.record(
+            "partition_merged", "", station_id, members=list(record.members)
+        )
+        return {
+            "ok": True,
+            "station_id": station_id,
+            "merge": record.as_dict(),
+            "violations": [],
+        }
+
+    def split_merge(self, station_id: str, reason: str = "manual") -> dict:
+        """拆掉站台的临时合并，各分区退回独立放行。"""
+
+        record = self.partitions.split_merge(station_id)
+        if record is None:
+            return {"ok": False, "station_id": station_id, "violations": ["站台没有合并记录"]}
+        self.audit.record(
+            "partition_split",
+            "",
+            station_id,
+            members=list(record.members),
+            reason=reason,
+        )
+        return {
+            "ok": True,
+            "station_id": station_id,
+            "members": list(record.members),
+            "violations": [],
+        }
 
     def arm(self, train_id: str, armed: bool) -> dict:
         """启用或退出一列车的联锁。"""
@@ -623,11 +946,12 @@ class Platform:
         return {"ok": verdict.advanced, "verdict": verdict.as_dict(), "violations": [] if verdict.advanced else [verdict.reason]}
 
     def batch_open(self, station_id: str) -> dict:
-        """按布局里程顺序批量开门。"""
+        """按放行域批量开门：每个分区按自己的里程顺序与限流放行。"""
 
         layout = self.layouts.get(station_id)
         zones = list(layout.zones) if layout else []
-        outcome = batch_open(self.doors, station_id, zones)
+        domains = self.partitions.domains(station_id, self.doors.batch_limit())
+        outcome = batch_open(self.doors, station_id, zones, domains or None)
         nearest = nearest_zone(zones)
         self.audit.record(
             "batch_open",
@@ -635,6 +959,7 @@ class Platform:
             station_id,
             opened=len(outcome["opened"]),
             skipped=len(outcome["skipped"]),
+            domains=len(outcome["domains"]),
         )
         return {
             "ok": not outcome["skipped"],
@@ -643,6 +968,7 @@ class Platform:
             "opened": outcome["opened"],
             "deferred": outcome["deferred"],
             "skipped": outcome["skipped"],
+            "domains": outcome["domains"],
             "nearest": nearest.id if nearest else "",
             "violations": [],
         }
@@ -678,7 +1004,13 @@ class Platform:
         stale = [
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
         ]
-        interlock = interlock_status(self.faults, self.gates, self.config.interlock.max_locked_ratio)
+        interlock = interlock_status(
+            self.faults,
+            self.gates,
+            self.config.interlock.max_locked_ratio,
+            partitions=self.partitions.list(),
+            failure_mode=self.config.partition.failure_mode,
+        )
         holding = [
             train.id
             for train in self.trains.list()
@@ -739,8 +1071,13 @@ class Platform:
             "door_report": door_report(self.doors, self.namespace.station_ids()),
             "signals": signal_summary(self.signals, ids),
             "interlock": interlock_status(
-                self.faults, self.gates, self.config.interlock.max_locked_ratio
+                self.faults,
+                self.gates,
+                self.config.interlock.max_locked_ratio,
+                partitions=self.partitions.list(),
+                failure_mode=self.config.partition.failure_mode,
             ),
+            "partitions": self.partition_view(),
             "gaps": gap_summary(self.gaps, ids),
             "quota": {
                 ARRIVAL: self.quotas.status(ARRIVAL),
@@ -773,6 +1110,7 @@ class Platform:
                 for station_id in self.namespace.station_ids()
             },
             "adjacent": self._adjacent_sample(),
+            "partitions": self.partition_view(),
             "timeline": build_timeline(self.audit.list(), limit=20),
         }
 
@@ -819,6 +1157,45 @@ class Platform:
             "group_key": group_key,
             "group": group,
             "neighbours": adjacent(self.mappings, station_id, group_key),
+        }
+
+    def partition_view(self, station_id: str | None = None) -> dict:
+        """返回控制分区视图：状态、放行域、限流与开门压力。
+
+        视图只读：门控、联锁与审计共用同一份分区事实，控制台看到的就是
+        控制循环实际使用的放行域划分。
+        """
+
+        station_ids = [station_id] if station_id else self.namespace.station_ids()
+        base_limit = self.doors.batch_limit()
+        domains: list[dict] = []
+        merges: list[dict] = []
+        for sid in station_ids:
+            gates = self.gates.by_station(sid)
+            for domain in self.partitions.domains(sid, base_limit):
+                members = [gate for gate in gates if gate.group in domain.groups]
+                domains.append(
+                    {
+                        **domain.as_dict(),
+                        "gates": len(members),
+                        "open_count": len([gate for gate in members if gate.open]),
+                        "locked_count": len([gate for gate in members if gate.locked]),
+                        "faults": [
+                            gate.id
+                            for gate in members
+                            if self.faults.is_active(gate.id)
+                        ],
+                    }
+                )
+            merge = self.partitions.active_merge(sid)
+            if merge is not None:
+                merges.append(merge.as_dict())
+        return {
+            "mode": self.config.partition.failure_mode,
+            "allow_merge": self.config.partition.allow_merge,
+            "base_limit": base_limit,
+            "domains": domains,
+            "merges": merges,
         }
 
     def note_error(self, error: RailError) -> dict:

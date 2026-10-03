@@ -88,6 +88,20 @@ class InterlockSection:
 
 
 @dataclass(frozen=True)
+class PartitionSection:
+    """控制分区限值。
+
+    ``failure_mode`` 决定分区故障时的整站语义：``isolate`` 只让故障分区退出、
+    其余分区按原语义运行；``degrade`` 回到整站降级（任一锁定比例超限就卡住
+    全站放行）。``allow_merge`` 控制同站健康分区能否临时并成一个放行域。
+    """
+
+    groups_per_partition: int = 2
+    failure_mode: str = "isolate"
+    allow_merge: bool = True
+
+
+@dataclass(frozen=True)
 class QuotaSection:
     """运行配额。"""
 
@@ -122,6 +136,7 @@ class PlatformConfig:
     gap: GapSection = field(default_factory=GapSection)
     signal: SignalSection = field(default_factory=SignalSection)
     interlock: InterlockSection = field(default_factory=InterlockSection)
+    partition: PartitionSection = field(default_factory=PartitionSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
@@ -165,6 +180,10 @@ class PlatformConfig:
             raise ConfigError("序号模数固定为 65536", component="config")
         if not 0 < self.interlock.max_locked_ratio <= 1:
             raise ConfigError("锁定比例上限必须落在 (0, 1]", component="config")
+        if self.partition.groups_per_partition <= 0:
+            raise ConfigError("每分区门区数必须为正", component="config")
+        if self.partition.failure_mode not in ("isolate", "degrade"):
+            raise ConfigError("分区故障模式必须是 isolate 或 degrade", component="config")
         if self.quota.arrival_limit <= 0 or self.quota.depart_limit <= 0:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
@@ -211,6 +230,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "gap": dict(config.gap.__dict__),
         "signal": dict(config.signal.__dict__),
         "interlock": dict(config.interlock.__dict__),
+        "partition": dict(config.partition.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
         "console": dict(config.console.__dict__),
@@ -231,6 +251,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         gap=_section(GapSection, payload.get("gap")),
         signal=_section(SignalSection, payload.get("signal")),
         interlock=_section(InterlockSection, payload.get("interlock")),
+        partition=_section(PartitionSection, payload.get("partition")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
         console=_section(ConsoleSection, payload.get("console")),

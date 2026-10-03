@@ -47,6 +47,11 @@ class FaultRegistry:
             return str(raw.get("state", ""))
         return ""
 
+    def is_active(self, psd_id: str) -> bool:
+        """判断门区当前是否有置位故障。"""
+
+        return self.state(psd_id) == ACTIVE
+
     def set_fault(self, lockouts: LockoutRegistry, psd_id: str, at: float) -> None:
         """置位故障并把对应门锁定。"""
 

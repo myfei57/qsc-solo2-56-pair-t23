@@ -40,6 +40,11 @@
     "hold_after_fault_s": 3.0,
     "max_locked_ratio": 0.5
   },
+  "partition": {
+    "groups_per_partition": 2,
+    "failure_mode": "isolate",
+    "allow_merge": true
+  },
   "quota": {
     "arrival_limit": 1000,
     "depart_limit": 1000

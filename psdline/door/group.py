@@ -1,12 +1,14 @@
 """门区联动。
 
 门区联动按站台门区映射把逻辑门区解析成物理门区，再整组开门。映射过期（修订号
-落后于布局）时拒绝动作，避免按旧布局把门开错位置。
+落后于布局）时拒绝动作，避免按旧布局把门开错位置。给定分区登记表时，目标门区
+所属分区已隔离就直接拒绝——隔离分区的门只能由恢复流程并回后再开。
 """
 
 from __future__ import annotations
 
-from ..errors import MappingError
+from ..errors import MappingError, PartitionError
+from ..partition import ACTIVE, PartitionRegistry
 from ..platform import MappingRegistry
 from .door import DoorController
 
@@ -20,10 +22,18 @@ def open_group(
     mapping: MappingRegistry,
     station_id: str,
     group_key: str,
+    partitions: PartitionRegistry | None = None,
 ) -> dict:
     """按映射打开一个门区组。"""
 
     resolved = mapping.resolve(station_id, group_key)
+    if partitions is not None:
+        partition = partitions.of_group(station_id, resolved)
+        if partition is not None and partition.state != ACTIVE:
+            raise PartitionError(
+                f"门区 {resolved} 所属分区 {partition.id} 已隔离，拒绝开门",
+                component="door",
+            )
     gate_ids = [gate.id for gate in controller.gates.by_station(station_id) if gate.group == resolved]
     if not gate_ids:
         raise MappingError(
