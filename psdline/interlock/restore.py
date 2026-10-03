@@ -16,15 +16,27 @@ def restore_lockouts(
     gates: PSDRegistry,
     lockouts,
     gap_clear: bool,
+    keep_locked: set[str] | None = None,
 ) -> dict:
-    """按故障登记表还原全部门的锁定状态。"""
+    """按故障登记表还原全部门的锁定状态。
 
+    ``keep_locked`` 里的门属于已落盘为"退出"的控制分区：即使故障登记表里没有
+    置位故障（例如人工隔离或清扫失败隔离），重启后也保持锁定，把"是否并回"留给
+    现场显式恢复，而不是在一次重启里悄悄解锁。
+    """
+
+    kept = keep_locked or set()
     actions: list[dict] = []
     for gate in gates.list():
         state = faults.state(gate.id)
         if state == ACTIVE:
             lockouts.set(gate.id, True)
             actions.append({"psd_id": gate.id, "action": "locked", "reason": "fault_active"})
+            continue
+        if gate.id in kept:
+            if not gate.locked:
+                lockouts.set(gate.id, True)
+            actions.append({"psd_id": gate.id, "action": "kept_locked", "reason": "partition_degraded"})
             continue
         allowed, reason = releasable(gates, gate.id, gap_clear)
         if gate.locked and not allowed:

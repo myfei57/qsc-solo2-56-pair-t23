@@ -88,6 +88,19 @@ class InterlockSection:
 
 
 @dataclass(frozen=True)
+class PartitionSection:
+    """门控隔离分区。
+
+    ``groups_per_partition`` 是每个分区包含的门区数：``0`` 表示一个站台整体作为
+    一个分区（等同旧的整站门控，默认值以保持现场既有行为）；正整数把站台门区按
+    里程由近及远切成连续分区，一个分区故障只退出该区，其他分区继续运行。分区拓扑
+    只在标定（启动播种）期生效，运行期不临时合并。
+    """
+
+    groups_per_partition: int = 0
+
+
+@dataclass(frozen=True)
 class QuotaSection:
     """运行配额。"""
 
@@ -122,6 +135,7 @@ class PlatformConfig:
     gap: GapSection = field(default_factory=GapSection)
     signal: SignalSection = field(default_factory=SignalSection)
     interlock: InterlockSection = field(default_factory=InterlockSection)
+    partition: PartitionSection = field(default_factory=PartitionSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
@@ -165,6 +179,8 @@ class PlatformConfig:
             raise ConfigError("序号模数固定为 65536", component="config")
         if not 0 < self.interlock.max_locked_ratio <= 1:
             raise ConfigError("锁定比例上限必须落在 (0, 1]", component="config")
+        if self.partition.groups_per_partition < 0:
+            raise ConfigError("每分区门区数不能为负（0 表示每站一区）", component="config")
         if self.quota.arrival_limit <= 0 or self.quota.depart_limit <= 0:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
@@ -211,6 +227,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "gap": dict(config.gap.__dict__),
         "signal": dict(config.signal.__dict__),
         "interlock": dict(config.interlock.__dict__),
+        "partition": dict(config.partition.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
         "console": dict(config.console.__dict__),
@@ -231,6 +248,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         gap=_section(GapSection, payload.get("gap")),
         signal=_section(SignalSection, payload.get("signal")),
         interlock=_section(InterlockSection, payload.get("interlock")),
+        partition=_section(PartitionSection, payload.get("partition")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
         console=_section(ConsoleSection, payload.get("console")),

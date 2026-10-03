@@ -10,7 +10,7 @@ from __future__ import annotations
 from .lockout import LockoutRegistry
 from .psd import PSD, PSDRegistry
 from .status import gate_status, station_status
-from .sweep import sweep_station
+from .sweep import sweep_partitions, sweep_station
 
 __all__ = [
     "LockoutRegistry",
@@ -18,5 +18,6 @@ __all__ = [
     "PSDRegistry",
     "gate_status",
     "station_status",
+    "sweep_partitions",
     "sweep_station",
 ]

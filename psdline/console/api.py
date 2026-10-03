@@ -65,6 +65,8 @@ class Api:
         add("GET", "/api/doors", lambda params, body: {"doors": self._platform.status()["doors"]})
         add("GET", "/api/doors/{psdID}", self._gate)
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
+        add("GET", "/api/partitions", self._partitions)
+        add("GET", "/api/partitions/{partitionID}", self._partition)
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
         add("GET", "/api/audit", self._audit)
@@ -83,6 +85,9 @@ class Api:
         add("POST", "/api/batch-open", self._batch_open)
         add("POST", "/api/fault", self._fault)
         add("POST", "/api/clear-fault", self._clear_fault)
+        add("POST", "/api/partition-isolate", self._partition_isolate)
+        add("POST", "/api/partition-recover", self._partition_recover)
+        add("POST", "/api/partition-quota", self._partition_quota)
         add("POST", "/api/arm", self._arm)
         add("POST", "/api/position", self._position)
         add("POST", "/api/sequence", self._sequence)
@@ -179,6 +184,7 @@ class Api:
         checks = {
             "stations": bool(self._platform.stations.list()),
             "gates": bool(self._platform.gates.list()),
+            "partitions": bool(self._platform.partitions.list()),
             "quota_arrival": self._platform.quotas.status("arrival")["configured"],
             "quota_depart": self._platform.quotas.status("depart")["configured"],
             "audit_log": self._platform.audit.journal.count() >= 0,
@@ -227,6 +233,45 @@ class Api:
 
     def _clear_fault(self, params: dict, body: dict) -> dict:
         return self._platform.clear_fault(_require(body, "psd_id"))
+
+    def _partitions(self, params: dict, body: dict) -> dict:
+        station_id = str(params.get("station_id", ""))
+        summary = self._platform.partitions.summary()
+        if station_id:
+            summary = {
+                **summary,
+                "partitions": [
+                    item
+                    for item in summary["partitions"]
+                    if item["station_id"] == station_id
+                ],
+            }
+            summary["count"] = len(summary["partitions"])
+            summary["active"] = sum(
+                1 for item in summary["partitions"] if item["phase"] == "active"
+            )
+            summary["degraded"] = sum(
+                1 for item in summary["partitions"] if item["phase"] == "degraded"
+            )
+        return summary
+
+    def _partition(self, params: dict, body: dict) -> dict:
+        return self._platform.partitions.require(str(params.get("partitionID", ""))).as_dict()
+
+    def _partition_isolate(self, params: dict, body: dict) -> dict:
+        return self._platform.isolate_partition(
+            _require(body, "partition_id"), str(body.get("reason", "manual"))
+        )
+
+    def _partition_recover(self, params: dict, body: dict) -> dict:
+        return self._platform.recover_partition(_require(body, "partition_id"))
+
+    def _partition_quota(self, params: dict, body: dict) -> dict:
+        return self._platform.set_partition_quota(
+            _require(body, "partition_id"),
+            str(body.get("operation", "arrival")),
+            _as_int(body, "limit", 0),
+        )
 
     def _arm(self, params: dict, body: dict) -> dict:
         return self._platform.arm(_require(body, "train_id"), bool(body.get("armed", True)))

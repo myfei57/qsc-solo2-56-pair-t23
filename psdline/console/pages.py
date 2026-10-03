@@ -80,6 +80,19 @@ def _station_page(platform: Platform) -> str:
         [(item["station"]["id"], f"修订 {item['revision']} 跨度 {item['span_m']} m") for item in views]
         or [("暂无", "-")],
     )
+    partition_rows = [
+        (
+            part["id"],
+            f"{'退出' if part['phase'] == 'degraded' else '正常'} "
+            f"门区 {','.join(part['groups'])}{('（' + part['reason'] + '）') if part['reason'] else ''}",
+        )
+        for view in views
+        for part in view.get("partitions", [])
+    ]
+    body += _table(
+        f"控制分区（正常 {status['partitions']['active']} / 退出 {status['partitions']['degraded']}）",
+        partition_rows or [("暂无", "-")],
+    )
     return _shell("站台控制台", body)
 
 
